@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SLAM: Reality vs Belief</title>
+<style>
+:root{--bg:#fafaf7;--fg:#1f2328;--mut:#667;--card:#fff;--bd:#d8d8d0;--acc:#2f6fed;--good:#1a9e5c;--bad:#d9453b;--map:#f1efe8;--pl:45%;--am:#d08a00;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15171a;--fg:#e8e8e4;--mut:#99a;--card:#1f2226;--bd:#363a40;--acc:#6b9bff;--good:#3cc884;--bad:#ff6b60;--map:#14161a;--pl:62%;--am:#f0b429}}
+:root[data-theme="dark"]{--bg:#15171a;--fg:#e8e8e4;--mut:#99a;--card:#1f2226;--bd:#363a40;--acc:#6b9bff;--good:#3cc884;--bad:#ff6b60;--map:#14161a;--pl:62%;--am:#f0b429}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:4px 0 2px}p.sub{margin:0 0 12px;color:var(--mut);font-size:14px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:12px}
+canvas{width:100%;max-width:100%;height:auto;display:block;border-radius:8px;background:var(--map)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:640px){.two{grid-template-columns:1fr}}
+.t{font-size:13px;font-weight:600;margin:2px 0 4px}.t span{font-weight:400;color:var(--mut)}
+.stages{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.pill{flex:1;min-width:100px;text-align:center;padding:6px 8px;border-radius:999px;border:1px solid var(--bd);font-size:13px;color:var(--mut)}
+.pill.on{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px}
+button{font:inherit;font-size:14px;padding:7px 14px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg);cursor:pointer}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+label{font-size:13px;color:var(--mut);display:flex;gap:6px;align-items:center}input[type=range]{width:100px}
+.leg{font-size:12.5px;color:var(--mut);display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}
+.leg i{display:inline-block;width:14px;height:3px;margin-right:5px;vertical-align:middle;border-radius:2px}
+#cap{min-height:96px;font-size:14px}#stat{font-size:13px;color:var(--mut);margin-top:6px}
+.grad{background:linear-gradient(90deg,hsl(210 85% 55%),hsl(20 85% 55%))}
+</style></head><body><main>
+<h1>SLAM: what is real vs what the robot believes</h1>
+<p class="sub">Left: the true world. Right: the robot's own picture, built only from odometry and lidar. Watch the two disagree, then get fixed.</p>
+<div class="card">
+<div class="stages"><div class="pill" id="s0">1 · Drive &amp; drift</div><div class="pill" id="s1">2 · Loop closure</div><div class="pill" id="s2">3 · Optimize</div><div class="pill" id="s3">4 · Result</div></div>
+<div class="two">
+<div><div class="t">REALITY <span>(the robot can't see this)</span></div><canvas id="L" width="480" height="328"></canvas></div>
+<div><div class="t">THE ROBOT'S BELIEF <span>(map + pose graph)</span></div><canvas id="c" width="480" height="328"></canvas></div>
+</div>
+<div class="t" style="margin-top:10px">How wrong is the robot? <span>(distance between believed and real position, for each pose)</span></div>
+<canvas id="E" width="960" height="150"></canvas>
+<div class="leg"><span><i style="background:var(--acc)"></i>real robot &amp; path</span><span><i style="background:var(--bad)"></i>believed pose / path / error</span><span><i style="background:var(--am)"></i>odometry edge</span><span><i style="background:var(--good)"></i>loop-closure edge</span><span><i class="grad"></i>lidar points (blue = early, orange = late)</span></div>
+<div class="row"><button class="p" id="play">Pause</button><button id="nx">Next stage ▸</button><button id="re">Replay</button><label>Speed <input type="range" id="sp" min="0.5" max="3" step="0.5" value="1"></label></div>
+</div>
+<div class="card"><div id="cap"></div><div id="stat"></div></div>
+</main>
+<script>
+const L=document.getElementById('L').getContext('2d'),C=document.getElementById('c').getContext('2d'),E=document.getElementById('E').getContext('2d');
+const S=19,OX=12,OY=12,NB=60,MAXR=8,segs=[],OB=[[7,5,17,11],[1.2,7,2.4,8.2],[12,.6,13,1.4],[22,6.5,23,7.5],[10,14.4,11,15.4]];
+const rect=(a,b,c,d)=>segs.push([a,b,c,b],[c,b,c,d],[c,d,a,d],[a,d,a,b]);rect(0,0,24,16);OB.forEach(r=>rect(...r));
+const wrap=a=>{while(a>Math.PI)a-=2*Math.PI;while(a<-Math.PI)a+=2*Math.PI;return a};
+const comp=(a,d)=>{const c=Math.cos(a.th),s=Math.sin(a.th);return{x:a.x+c*d.x-s*d.y,y:a.y+s*d.x+c*d.y,th:wrap(a.th+d.th)}};
+const rel=(a,b)=>{const c=Math.cos(a.th),s=Math.sin(a.th),dx=b.x-a.x,dy=b.y-a.y;return{x:c*dx+s*dy,y:-s*dx+c*dy,th:wrap(b.th-a.th)}};
+const rnd=()=>{let u=0;while(!u)u=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*Math.random())};
+function ray(x,y,a){const dx=Math.cos(a),dy=Math.sin(a);let b=MAXR;for(const s of segs){const ex=s[2]-s[0],ey=s[3]-s[1],den=dx*ey-dy*ex;if(Math.abs(den)<1e-9)continue;
+ const t=((s[0]-x)*ey-(s[1]-y)*ex)/den,u=((s[0]-x)*dy-(s[1]-y)*dx)/den;if(t>=0&&t<b&&u>=0&&u<=1)b=t}return b}
+let T,od,est,scans,N,edges,zl,disp,K,stage,t,its,itK,u,init,errB,ymax,acc=0,playing=true;
+function build(){const pts=[],Ln=(a,b,c,d)=>{const n=Math.ceil(Math.hypot(c-a,d-b)/.05);for(let i=0;i<n;i++)pts.push([a+(c-a)*i/n,b+(d-b)*i/n])},
+ A=(cx,cy,a0,a1)=>{for(let i=0;i<80;i++){const a=a0+(a1-a0)*i/80;pts.push([cx+2*Math.cos(a),cy+2*Math.sin(a)])}},P=Math.PI;
+ Ln(5.5,2.5,18.5,2.5);A(18.5,4.5,-P/2,0);Ln(20.5,4.5,20.5,11.5);A(18.5,11.5,0,P/2);Ln(18.5,13.5,5.5,13.5);A(5.5,11.5,P/2,P);Ln(3.5,11.5,3.5,4.5);A(5.5,4.5,P,1.5*P);Ln(5.5,2.5,6.1,2.5);
+ const Q=[pts[0]];let ac=0;for(let i=1;i<pts.length;i++){ac+=Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1]);if(ac>=.6){Q.push(pts[i]);ac=0}}
+ T=Q.map((p,k)=>{const q=Q[Math.min(k+1,Q.length-1)],r=k<Q.length-1?[q[0]-p[0],q[1]-p[1]]:[p[0]-Q[k-1][0],p[1]-Q[k-1][1]];return{x:p[0],y:p[1],th:Math.atan2(r[1],r[0])}});
+ N=T.length;od=[null];for(let k=1;k<N;k++){const d=rel(T[k-1],T[k]);od.push({x:d.x*1.01+rnd()*.012,y:d.y+rnd()*.012,th:d.th+.003+rnd()*.004})}
+ est=[{...T[0]}];for(let k=1;k<N;k++)est.push(comp(est[k-1],od[k]));
+ scans=T.map(p=>{const o=[];for(let b=0;b<NB;b++){const a=b*2*P/NB;let r=ray(p.x,p.y,p.th+a);if(r<MAXR-.01){r+=rnd()*.02;o.push([Math.cos(a)*r,Math.sin(a)*r])}}return o});
+ edges=[];for(let k=1;k<N;k++)edges.push({i:k-1,j:k,z:od[k],wx:400,wt:10000});
+ const z=rel(T[0],T[N-1]);zl={x:z.x+rnd()*.02,y:z.y+rnd()*.02,th:z.th+rnd()*.008};
+ errB=est.map((p,k)=>Math.hypot(p.x-T[k].x,p.y-T[k].y));ymax=Math.max(.5,Math.max(...errB)*1.15);
+ disp=est.map(p=>({...p}));K=1;stage=0;t=0;its=null;init=0;ui()}
+const res=(P,e)=>{const a=P[e.i],b=P[e.j],c=Math.cos(a.th),s=Math.sin(a.th),dx=b.x-a.x,dy=b.y-a.y;return[c*dx+s*dy-e.z.x,-s*dx+c*dy-e.z.y,wrap(b.th-a.th-e.z.th)]};
+const cost=P=>edges.reduce((q,e)=>{const r=res(P,e);return q+e.wx*(r[0]*r[0]+r[1]*r[1])+e.wt*r[2]*r[2]},0);
+function solve(A,b,n){for(let c=0;c<n;c++){let p=c,m=Math.abs(A[c*n+c]);for(let r=c+1;r<n;r++){const v=Math.abs(A[r*n+c]);if(v>m){m=v;p=r}}
+ if(p!=c){for(let k=c;k<n;k++){const x=A[c*n+k];A[c*n+k]=A[p*n+k];A[p*n+k]=x}const x=b[c];b[c]=b[p];b[p]=x}
+ const d=A[c*n+c];for(let r=c+1;r<n;r++){const f=A[r*n+c]/d;if(!f)continue;for(let k=c;k<n;k++)A[r*n+k]-=f*A[c*n+k];b[r]-=f*b[c]}}
+ const x=new Float64Array(n);for(let r=n-1;r>=0;r--){let s=b[r];for(let k=r+1;k<n;k++)s-=A[r*n+k]*x[k];x[r]=s/A[r*n+r]}return x}
+function gn(P){const n=P.length,D=3*n,H=new Float64Array(D*D),g=new Float64Array(D);
+ for(const e of edges){const a=P[e.i],b=P[e.j],c=Math.cos(a.th),s=Math.sin(a.th),dx=b.x-a.x,dy=b.y-a.y,r=res(P,e),w=[e.wx,e.wx,e.wt];
+  const Ja=[[-c,-s,-s*dx+c*dy],[s,-c,-c*dx-s*dy],[0,0,-1]],Jb=[[c,s,0],[-s,c,0],[0,0,1]],Js=[[Ja,e.i],[Jb,e.j]];
+  for(const[A,p]of Js){for(let q=0;q<3;q++){let v=0;for(let k=0;k<3;k++)v+=A[k][q]*w[k]*r[k];g[3*p+q]+=v}
+   for(const[B,q]of Js)for(let i=0;i<3;i++)for(let j=0;j<3;j++){let m=0;for(let k=0;k<3;k++)m+=A[k][i]*w[k]*B[k][j];H[(3*p+i)*D+3*q+j]+=m}}}
+ for(let k=0;k<3;k++)H[k*D+k]+=1e6;for(let k=0;k<D;k++)g[k]=-g[k];
+ const d=solve(H,g,D);let mx=0;P.forEach((p,i)=>mx=Math.max(mx,Math.abs(d[3*i]),Math.abs(d[3*i+1])));
+ return{mx,out:P.map((p,i)=>({x:p.x+d[3*i],y:p.y+d[3*i+1],th:wrap(p.th+d[3*i+2])}))}}
+function startOpt(){its=[est.map(p=>({...p}))];for(let i=0;i<8;i++){const r=gn(its[its.length-1]);its.push(r.out);if(r.mx<1e-4)break}itK=0;u=0;stage=2;t=0;ui()}
+const CAP=["<b>Left is reality, right is the robot's belief.</b> The robot only has wheel odometry and a lidar. Each pose becomes a <i>node</i> and each odometry measurement an <i>edge</i> in a graph. Odometry has tiny errors that add up, so watch the red believed pose slide away from the real robot on the left, while lidar points on the right start to smear.",
+"<b>Loop closure.</b> Back at the start, the robot matches its current scan to an old one and recognises the place. That adds a new green edge: &ldquo;this pose is <i>here</i> relative to node 0&rdquo;. Compare the believed pose with the loop edge's prediction (green circle): the red dashed line is the drift error. The loop edge is a trustworthy measurement that disagrees with the long chain of odometry edges.",
+"<b>Optimize.</b> Think of every edge as a spring that wants the poses to match its measurement. Gauss&ndash;Newton moves <i>all</i> poses to minimise the total spring stretch. Notice how the red believed pose on the left walks back toward the real robot, and the error curve below drops.",
+"<b>Result.</b> The error was spread over the whole path, not just the last pose. The doubled walls merged into one consistent map, and the believed path now hugs the real one. The dashed red path on the right is what the robot believed before the loop closure."];
+function ui(){for(let i=0;i<4;i++)document.getElementById('s'+i).classList.toggle('on',i==stage);let c=CAP[stage];
+ if(stage==2&&its)c+=" <br><i>Iteration "+Math.min(itK+1,its.length-1)+" of "+(its.length-1)+".</i>";document.getElementById('cap').innerHTML=c}
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim(),X=x=>OX+x*S,Y=y=>OY+y*S;
+function line(c,a,b,col,w,dash){c.strokeStyle=col;c.lineWidth=w;c.setLineDash(dash||[]);c.beginPath();c.moveTo(X(a.x),Y(a.y));c.lineTo(X(b.x),Y(b.y));c.stroke();c.setLineDash([])}
+function ring(c,p,col,r,w){c.strokeStyle=col;c.lineWidth=w||2.5;c.beginPath();c.arc(X(p.x),Y(p.y),r,0,7);c.stroke()}
+function path(c,P,n,col,w,dash){c.strokeStyle=col;c.lineWidth=w;c.setLineDash(dash||[]);c.beginPath();for(let k=0;k<n;k++)k?c.lineTo(X(P[k].x),Y(P[k].y)):c.moveTo(X(P[k].x),Y(P[k].y));c.stroke();c.setLineDash([])}
+function robot(c,p,col){c.fillStyle=col;c.beginPath();c.arc(X(p.x),Y(p.y),6,0,7);c.fill();line(c,p,{x:p.x+Math.cos(p.th)*.6,y:p.y+Math.sin(p.th)*.6},'#fff',2)}
+function drawL(){const c=L,fg=css('--fg'),acc=css('--acc'),bad=css('--bad');c.clearRect(0,0,480,328);
+ c.fillStyle=fg;c.globalAlpha=.2;OB.forEach(r=>c.fillRect(X(r[0]),Y(r[1]),(r[2]-r[0])*S,(r[3]-r[1])*S));c.globalAlpha=.8;c.strokeStyle=fg;c.lineWidth=2;
+ c.strokeRect(X(0),Y(0),24*S,16*S);OB.forEach(r=>c.strokeRect(X(r[0]),Y(r[1]),(r[2]-r[0])*S,(r[3]-r[1])*S));c.globalAlpha=1;
+ path(c,T,K,acc,2.2);path(c,disp,K,bad,1.5,[4,3]);
+ const p=T[K-1],cs=Math.cos(p.th),sn=Math.sin(p.th);c.strokeStyle=acc;c.globalAlpha=.25;c.lineWidth=1;
+ for(const q of scans[K-1]){c.beginPath();c.moveTo(X(p.x),Y(p.y));c.lineTo(X(p.x+cs*q[0]-sn*q[1]),Y(p.y+sn*q[0]+cs*q[1]));c.stroke()}c.globalAlpha=1;
+ const g=disp[K-1];line(c,p,g,bad,1.5);ring(c,g,bad,9,2);robot(c,p,acc);
+ c.fillStyle=bad;c.font="12px system-ui,sans-serif";c.fillText("believed",X(g.x)+11,Y(g.y)-9);c.fillStyle=acc;c.fillText("real robot",X(p.x)+9,Y(p.y)+16)}
+function drawC(){const c=C,am=css('--am'),good=css('--good'),bad=css('--bad'),acc=css('--acc'),fg=css('--fg'),pl=css('--pl');c.clearRect(0,0,480,328);
+ if(stage>=2)path(c,est,N,bad,1.2,[5,4]);
+ for(let k=0;k<K;k++){const p=disp[k],cs=Math.cos(p.th),sn=Math.sin(p.th);c.fillStyle="hsl("+(210-190*k/(N-1))+" 85% "+pl+")";
+  for(const q of scans[k])c.fillRect(X(p.x+cs*q[0]-sn*q[1])-.8,Y(p.y+sn*q[0]+cs*q[1])-.8,1.8,1.8)}
+ for(let k=1;k<K;k++)line(c,disp[k-1],disp[k],am,1.4);c.fillStyle=am;for(let k=0;k<K;k++){c.beginPath();c.arc(X(disp[k].x),Y(disp[k].y),1.9,0,7);c.fill()}
+ const R=disp[K-1];robot(c,R,acc);c.fillStyle=fg;c.font="12px system-ui,sans-serif";c.fillText("start",X(disp[0].x)-12,Y(disp[0].y)-10);
+ if(stage>=1){const lp=disp[N-1],pr=comp(disp[0],zl),pu=.5+.5*Math.sin(t/12);line(c,disp[0],lp,good,2);
+  if(stage==1){c.globalAlpha=.4+.6*pu;ring(c,disp[0],good,11);ring(c,lp,good,11);c.globalAlpha=1;line(c,lp,pr,bad,2,[5,4]);ring(c,pr,good,5,2);c.fillStyle=bad;c.fillText("drift error",X((lp.x+pr.x)/2)+8,Y((lp.y+pr.y)/2)+16)}}}
+function plot(){const w=960,h=150,l=46,b=24,tp=10,r=12,pw=w-l-r,ph=h-b-tp,fg=css('--fg'),mu=css('--mut'),bd=css('--bd'),bad=css('--bad'),acc=css('--acc');E.clearRect(0,0,w,h);
+ const px=k=>l+pw*k/(N-1),py=v=>tp+ph*(1-v/ymax);E.font="11px system-ui,sans-serif";E.fillStyle=mu;E.strokeStyle=bd;E.lineWidth=1;
+ for(let i=0;i<=2;i++){const v=ymax*i/2,y=py(v);E.beginPath();E.moveTo(l,y);E.lineTo(w-r,y);E.stroke();E.fillText(v.toFixed(1)+" m",4,y+4)}
+ E.fillText("pose # (time →)",w/2-40,h-6);
+ const ln=(f,n,col)=>{E.strokeStyle=col;E.lineWidth=2;E.beginPath();for(let k=0;k<n;k++){const y=py(f(k));k?E.lineTo(px(k),y):E.moveTo(px(k),y)}E.stroke()};
+ ln(k=>errB[k],K,bad);if(stage>=2)ln(k=>Math.hypot(disp[k].x-T[k].x,disp[k].y-T[k].y),K,acc);
+ E.fillStyle=bad;E.fillText("odometry only",l+8,tp+12);if(stage>=2){E.fillStyle=acc;E.fillText("after optimization",l+100,tp+12)}}
+function draw(){drawL();drawC();plot();let le="—",tot="—";
+ if(stage>=1){const pr=comp(disp[0],zl),lp=disp[N-1];le=Math.hypot(pr.x-lp.x,pr.y-lp.y).toFixed(2)+" m";tot=cost(disp).toFixed(0)}
+ const pe=Math.hypot(disp[K-1].x-T[K-1].x,disp[K-1].y-T[K-1].y);
+ document.getElementById('stat').textContent="Poses: "+K+"  ·  Edges: "+edges.length+"  ·  Position error now: "+pe.toFixed(2)+" m"+(stage>=1?"  ·  Loop error: "+le+"  ·  Total graph error: "+tot+" (before: "+init.toFixed(0)+")":"")}
+const ease=x=>x*x*(3-2*x);
+function tick(){t++;
+ if(stage==0){if(t%10==0&&K<N)K++;if(K>=N){stage=1;t=0;edges.push({i:0,j:N-1,z:zl,wx:2500,wt:10000});init=cost(disp);ui()}}
+ else if(stage==1){if(t>360)startOpt()}
+ else if(stage==2){u+=1/90;const a=its[itK],b=its[itK+1],e=ease(Math.min(u,1));
+  disp=a.map((p,i)=>({x:p.x+(b[i].x-p.x)*e,y:p.y+(b[i].y-p.y)*e,th:p.th+wrap(b[i].th-p.th)*e}));
+  if(u>=1){itK++;u=0;if(itK>=its.length-1){disp=its[its.length-1].map(p=>({...p}));stage=3}ui()}}}
+function loop(){if(playing){acc+=+document.getElementById('sp').value;while(acc>=1){acc--;tick()}}draw();requestAnimationFrame(loop)}
+function next(){if(stage==0){K=N;stage=1;t=0;edges.push({i:0,j:N-1,z:zl,wx:2500,wt:10000});init=cost(disp);ui()}
+ else if(stage==1)startOpt();else if(stage==2){disp=its[its.length-1].map(p=>({...p}));itK=its.length-1;stage=3;ui()}}
+document.getElementById('play').onclick=e=>{playing=!playing;e.target.textContent=playing?'Pause':'Play'};
+document.getElementById('nx').onclick=next;document.getElementById('re').onclick=build;
+build();loop();
+</script></body></html>
